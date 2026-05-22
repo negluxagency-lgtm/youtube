@@ -1,0 +1,19 @@
+# Evitar subir videos y archivos temporales pesados
+artifacts/clips/
+artifacts/jobs/
+artifacts/logs/
+artifacts/*.mp4
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.env
+
+# Entornos virtuales
+venv/
+.venv/
+env/
