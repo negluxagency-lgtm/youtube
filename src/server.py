@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║       YUTU RENDER SERVER — API REST para n8n / automatización       ║
-║  Puerto: 8000  |  Motor: FastAPI + FFmpeg                           ║
+║       YUTU RENDER SERVER v2.0 — API REST para n8n                  ║
+║  Motor: FastAPI + FFmpeg 8.x + Ken Burns para imágenes             ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 ENDPOINTS:
-  POST /render          → Encola un job de renderizado (body = array de escenas)
-  GET  /status/{job_id} → Estado del job (pending / processing / done / error)
-  GET  /download/{job_id}→ Descarga el MP4 final cuando esté listo
-  GET  /jobs            → Lista todos los jobs activos
-  GET  /health          → Healthcheck
+  POST /render           → Body: array directo de media items
+  GET  /status/{job_id}  → Estado del job
+  GET  /download/{job_id}→ Descarga el MP4 final
+  GET  /jobs             → Lista todos los jobs
+  GET  /health           → Healthcheck
 
-FLUJO n8n:
-  1. HTTP Request (POST /render, body JSON) → recibe { job_id, status }
-  2. Loop/Wait → HTTP Request (GET /status/{job_id}) hasta status == "done"
-  3. HTTP Request (GET /download/{job_id}) → descarga el MP4
+TIPOS DE MEDIA SOPORTADOS:
+  - Vídeo  (.mp4, .mov, .webm) → trim + normalización
+  - Imagen (.jpg, .jpeg, .png) → Ken Burns animado (zoom/pan) → vídeo
+  - "SIN_IMAGENES_DISPONIBLES" → Frame negro silencioso
+
+BODY n8n (array JSON directo):
+  [
+    { "url": "https://cdn.pixabay.com/video/..._large.mp4", "posicion": 1, "score": 602970, "estimated_duration": 16 },
+    { "url": "https://pixabay.com/get/ga...jpg",           "posicion": 2, "score": 143867, "estimated_duration": 18 },
+    { "url": "SIN_IMAGENES_DISPONIBLES",                   "posicion": 3, "score": 0,      "estimated_duration": 11 },
+    ...
+  ]
 """
 
 import json
 import os
+import shutil
 import subprocess
 import time
 import uuid
 import logging
-import threading
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -33,7 +40,7 @@ from typing import List, Optional
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
@@ -46,7 +53,6 @@ LOGS_DIR      = ARTIFACTS_DIR / "logs"
 HOST          = "0.0.0.0"
 PORT          = 8000
 
-# Parámetros FFmpeg cinematográficos
 TARGET_W      = 1920
 TARGET_H      = 1080
 TARGET_FPS    = 30
@@ -55,7 +61,23 @@ PRESET        = "slow"
 CROSSFADE_DUR = 0.5
 DL_TIMEOUT    = 60
 MAX_RETRIES   = 3
-MIN_FILE_SIZE = 10_000
+MIN_FILE_SIZE = 5_000
+
+IMAGE_EXTS    = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+VIDEO_EXTS    = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+
+# Estilos Ken Burns — se alternan por posición
+# Cada estilo es una expresión de FFmpeg zoompan
+KEN_BURNS_STYLES = [
+    # 0: Zoom in desde el centro
+    "zoom_in_center",
+    # 1: Zoom out desde el centro
+    "zoom_out_center",
+    # 2: Pan de izquierda a derecha con zoom suave
+    "pan_left_right",
+    # 3: Pan de derecha a izquierda con zoom suave
+    "pan_right_left",
+]
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
@@ -64,44 +86,56 @@ logging.basicConfig(
     format="[%(asctime)s] %(levelname)s %(message)s",
     datefmt="%H:%M:%S"
 )
-log = logging.getLogger("yutu-server")
+log = logging.getLogger("yutu-v2")
 
 # ─── MODELOS PYDANTIC ─────────────────────────────────────────────────────────
 
-class Escena(BaseModel):
-    id_frase: int
-    duracion_video: int
-    url_video_mp4: str
-    origen_video: Optional[str] = "Unknown"
+class MediaItem(BaseModel):
+    url: str
+    posicion: int
+    score: int = 0
+    estimated_duration: int
 
-class RenderRequest(BaseModel):
-    escenas: List[Escena]
-    job_name: Optional[str] = None   # nombre descriptivo opcional
+# ─── STORE DE JOBS ───────────────────────────────────────────────────────────
 
-# ─── STORE DE JOBS (in-memory + disco) ───────────────────────────────────────
-
-jobs: dict = {}  # job_id → metadata dict
+jobs: dict = {}
 
 def save_job_state(job_id: str):
-    """Persiste el estado del job en disco para sobrevivir reinicios."""
     path = JOBS_DIR / job_id / "state.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(jobs[job_id], f, indent=2, default=str)
 
 def load_jobs_from_disk():
-    """Carga jobs persistidos al arrancar el servidor."""
     if not JOBS_DIR.exists():
         return
     for job_dir in JOBS_DIR.iterdir():
-        state_file = job_dir / "state.json"
-        if state_file.exists():
-            with open(state_file) as f:
+        sf = job_dir / "state.json"
+        if sf.exists():
+            with open(sf) as f:
                 data = json.load(f)
             jobs[data["job_id"]] = data
-            log.info(f"  Job recuperado: {data['job_id']} [{data['status']}]")
 
-# ─── PIPELINE FUNCTIONS ───────────────────────────────────────────────────────
+# ─── DETECCIÓN DE TIPO DE MEDIA ───────────────────────────────────────────────
+
+def detect_media_type(url: str) -> str:
+    """Devuelve 'video', 'image' o 'invalid'."""
+    if not url or url.strip().upper() in ("SIN_IMAGENES_DISPONIBLES", "NULL", "NONE", ""):
+        return "invalid"
+    url_lower = url.lower().split("?")[0]  # ignorar query params
+    ext = Path(url_lower).suffix
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in VIDEO_EXTS:
+        return "video"
+    # Sin extensión clara → intentar por contenido de la URL
+    if any(k in url_lower for k in ["pixabay.com/video", "cdn.pixabay.com/video", ".mp4"]):
+        return "video"
+    if any(k in url_lower for k in [".jpg", ".jpeg", ".png", "pixabay.com/get/"]):
+        return "image"
+    return "video"  # default: asumir vídeo
+
+# ─── FFMPEG HELPERS ───────────────────────────────────────────────────────────
 
 def run_ffmpeg(args: list, step: str) -> float:
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + args
@@ -109,15 +143,16 @@ def run_ffmpeg(args: list, step: str) -> float:
     result = subprocess.run(cmd, capture_output=True, text=True)
     elapsed = round(time.time() - t0, 2)
     if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg falló [{step}]: {result.stderr[-600:]}")
+        raise RuntimeError(f"FFmpeg [{step}]: {result.stderr[-800:]}")
     return elapsed
 
-def download_clip(url: str, dest: Path, idx: int) -> str:
+def download_file(url: str, dest: Path, idx: int) -> str:
+    """Descarga cualquier URL (imagen o vídeo) con caché y reintentos."""
     if dest.exists() and dest.stat().st_size > MIN_FILE_SIZE:
         return "cached"
     for intento in range(1, MAX_RETRIES + 1):
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; YutuBot/1.0)"}
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; YutuBot/2.0)"}
             resp = requests.get(url, stream=True, timeout=DL_TIMEOUT, headers=headers)
             resp.raise_for_status()
             with open(dest, "wb") as f:
@@ -128,17 +163,82 @@ def download_clip(url: str, dest: Path, idx: int) -> str:
             if intento < MAX_RETRIES:
                 time.sleep(2 ** intento)
             else:
-                raise RuntimeError(f"Descarga fallida escena {idx}: {e}")
+                raise RuntimeError(f"Descarga fallida [{idx}]: {e}")
 
-def normalize_clip(raw: Path, norm: Path, dur: int, idx: int):
-    if norm.exists() and norm.stat().st_size > MIN_FILE_SIZE:
+
+def process_image_kenburns(img_path: Path, norm_path: Path, dur: int, idx: int, style_idx: int = 0):
+    """
+    Convierte una imagen estática en un clip de vídeo con efecto Ken Burns.
+    Alterna entre 4 estilos: zoom in, zoom out, pan L→R, pan R→L.
+    """
+    if norm_path.exists() and norm_path.stat().st_size > MIN_FILE_SIZE:
         return "cached"
 
-    # Detectar audio
+    d_frames = dur * TARGET_FPS
+    style = KEN_BURNS_STYLES[style_idx % 4]
+
+    # Escala la imagen a 3840x2160 para tener margen de zoom/pan sin pixelado
+    pre_scale = f"scale=3840:2160:force_original_aspect_ratio=increase,crop=3840:2160"
+
+    if style == "zoom_in_center":
+        zoompan = (
+            f"zoompan=z='min(zoom+0.0012,1.4)':"
+            f"d={d_frames}:"
+            f"x='iw/2-(iw/zoom/2)':"
+            f"y='ih/2-(ih/zoom/2)':"
+            f"s={TARGET_W}x{TARGET_H}"
+        )
+    elif style == "zoom_out_center":
+        zoompan = (
+            f"zoompan=z='if(lte(zoom,1.0),1.35,max(1.001,zoom-0.001))':"
+            f"d={d_frames}:"
+            f"x='iw/2-(iw/zoom/2)':"
+            f"y='ih/2-(ih/zoom/2)':"
+            f"s={TARGET_W}x{TARGET_H}"
+        )
+    elif style == "pan_left_right":
+        zoompan = (
+            f"zoompan=z=1.25:"
+            f"d={d_frames}:"
+            f"x='if(lte(on,1),0,x+0.8)':"
+            f"y='ih/2-(ih/zoom/2)':"
+            f"s={TARGET_W}x{TARGET_H}"
+        )
+    else:  # pan_right_left
+        zoompan = (
+            f"zoompan=z=1.25:"
+            f"d={d_frames}:"
+            f"x='if(lte(on,1),iw-(iw/zoom),x-0.8)':"
+            f"y='ih/2-(ih/zoom/2)':"
+            f"s={TARGET_W}x{TARGET_H}"
+        )
+
+    vf = f"{pre_scale},{zoompan},fps={TARGET_FPS},format=yuv420p"
+
+    args = [
+        "-loop", "1",
+        "-i", str(img_path),
+        "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
+        "-vf", vf,
+        "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET,
+        "-c:a", "aac", "-b:a", "192k",
+        "-t", str(dur),
+        "-map", "0:v", "-map", "1:a",
+        str(norm_path)
+    ]
+    run_ffmpeg(args, f"kenburns_{idx:02d}_{style}")
+    return "kenburns"
+
+
+def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
+    """Normaliza un clip de vídeo a 1920x1080@30fps con trim exacto."""
+    if norm_path.exists() and norm_path.stat().st_size > MIN_FILE_SIZE:
+        return "cached"
+
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a",
          "-show_entries", "stream=codec_type",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(raw)],
+         "-of", "default=noprint_wrappers=1:nokey=1", str(raw_path)],
         capture_output=True, text=True
     )
     has_audio = "audio" in probe.stdout.strip()
@@ -153,85 +253,126 @@ def normalize_clip(raw: Path, norm: Path, dur: int, idx: int):
     if has_audio:
         af = f"atrim=start=0:end={dur},asetpts=PTS-STARTPTS,aresample=44100,pan=stereo|c0=c0|c1=c0"
         args = [
-            "-i", str(raw),
+            "-i", str(raw_path),
             "-vf", vf, "-af", af,
             "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
-            str(norm)
+            str(norm_path)
         ]
     else:
         args = [
-            "-i", str(raw),
+            "-i", str(raw_path),
             "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
             "-vf", vf,
             "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             "-map", "0:v", "-map", "1:a",
-            str(norm)
+            str(norm_path)
         ]
-    run_ffmpeg(args, f"norm_{idx:02d}")
+    run_ffmpeg(args, f"norm_video_{idx:02d}")
     return "normalized"
 
-def build_xfade_filtergraph(escenas: list):
-    n = len(escenas)
+
+def create_black_frame(norm_path: Path, dur: int, idx: int):
+    """Genera un clip negro silencioso para entradas inválidas."""
+    if norm_path.exists() and norm_path.stat().st_size > MIN_FILE_SIZE:
+        return "cached"
+    args = [
+        "-f", "lavfi", "-i",
+        f"color=c=black:size={TARGET_W}x{TARGET_H}:rate={TARGET_FPS}:d={dur}",
+        "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
+        "-c:v", "libx264", "-crf", str(CRF), "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k", "-t", str(dur),
+        str(norm_path)
+    ]
+    run_ffmpeg(args, f"black_{idx:02d}")
+    return "black_frame"
+
+
+def build_xfade_filtergraph(items: list):
+    """Construye el filter_complex para encadenar N clips con crossfade."""
+    n = len(items)
     if n == 1:
         return "", ["0:v", "0:a"]
     parts_v, parts_a = [], []
     offset = 0.0
     for i in range(n - 1):
-        in_v  = "[0:v]" if i == 0 else f"[vx{i}]"
-        in_a  = "[0:a]" if i == 0 else f"[ax{i}]"
-        out_v = "[vfinal]" if i == n - 2 else f"[vx{i+1}]"
-        out_a = "[afinal]" if i == n - 2 else f"[ax{i+1}]"
-        offset += escenas[i]["duracion_video"] - CROSSFADE_DUR
-        parts_v.append(f"{in_v}[{i+1}:v]xfade=transition=fade:duration={CROSSFADE_DUR}:offset={offset:.4f}{out_v}")
-        parts_a.append(f"{in_a}[{i+1}:a]acrossfade=d={CROSSFADE_DUR}:c1=tri:c2=tri{out_a}")
+        in_v  = "[0:v]"       if i == 0     else f"[vx{i}]"
+        in_a  = "[0:a]"       if i == 0     else f"[ax{i}]"
+        out_v = "[vfinal]"    if i == n - 2 else f"[vx{i+1}]"
+        out_a = "[afinal]"    if i == n - 2 else f"[ax{i+1}]"
+        offset += items[i]["estimated_duration"] - CROSSFADE_DUR
+        parts_v.append(
+            f"{in_v}[{i+1}:v]xfade=transition=fade:duration={CROSSFADE_DUR}:offset={offset:.4f}{out_v}"
+        )
+        parts_a.append(
+            f"{in_a}[{i+1}:a]acrossfade=d={CROSSFADE_DUR}:c1=tri:c2=tri{out_a}"
+        )
     return "; ".join(parts_v + parts_a), ["[vfinal]", "[afinal]"]
 
 # ─── WORKER DEL JOB ──────────────────────────────────────────────────────────
 
-def process_job(job_id: str, escenas_data: list):
-    """Ejecuta el pipeline completo en un thread background."""
+def process_job(job_id: str, items: list):
+    """Pipeline completo en thread background."""
     job = jobs[job_id]
-    job_dir = JOBS_DIR / job_id
+    job_dir  = JOBS_DIR / job_id
     clips_dir = job_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
     output_path = job_dir / "documental_final.mp4"
 
-    def update(status: str, msg: str, progress: int = None):
-        job["status"] = status
+    def update(status: str, msg: str, pct: int = None):
+        job["status"]  = status
         job["message"] = msg
-        if progress is not None:
-            job["progress_pct"] = progress
+        if pct is not None:
+            job["progress_pct"] = pct
         job["updated_at"] = datetime.now().isoformat()
         save_job_state(job_id)
-        log.info(f"  [{job_id[:8]}] {status.upper()}: {msg}")
+        log.info(f"  [{job_id[:8]}] {status.upper()} ({pct or '?'}%): {msg}")
 
     try:
-        total = len(escenas_data)
-
-        # ── FASE 1: Descargas ──────────────────────────────────────────────
-        update("processing", f"Descargando {total} clips...", 5)
+        total = len(items)
         norm_paths = []
-        for i, escena in enumerate(escenas_data):
-            idx  = escena["id_frase"]
-            url  = escena["url_video_mp4"]
-            dur  = escena["duracion_video"]
-            raw  = clips_dir / f"raw_{idx:02d}.mp4"
-            norm = clips_dir / f"norm_{idx:02d}.mp4"
 
-            pct_dl = 5 + int((i / total) * 35)
-            update("processing", f"Descargando escena {idx}/{total}...", pct_dl)
-            download_clip(url, raw, idx)
+        for i, item in enumerate(items):
+            idx  = item["posicion"]
+            url  = item["url"]
+            dur  = item["estimated_duration"]
+            mtype = detect_media_type(url)
 
+            pct_dl   = 5  + int((i / total) * 35)
             pct_norm = 40 + int((i / total) * 50)
-            update("processing", f"Normalizando escena {idx}/{total}...", pct_norm)
-            normalize_clip(raw, norm, dur, idx)
+
+            # ── Descarga ──────────────────────────────────────────────────
+            if mtype == "invalid":
+                log.info(f"  [{job_id[:8]}] Escena {idx}: URL inválida → frame negro")
+                norm = clips_dir / f"norm_{idx:04d}.mp4"
+                update("processing", f"Generando frame negro para escena {idx}...", pct_dl)
+                create_black_frame(norm, dur, idx)
+                norm_paths.append(norm)
+                continue
+
+            # Extensión del archivo para descarga
+            url_clean = url.split("?")[0]
+            ext = Path(url_clean).suffix or (".jpg" if mtype == "image" else ".mp4")
+            raw = clips_dir / f"raw_{idx:04d}{ext}"
+
+            update("processing", f"Descargando escena {idx} ({mtype})...", pct_dl)
+            download_file(url, raw, idx)
+
+            # ── Normalización ─────────────────────────────────────────────
+            norm = clips_dir / f"norm_{idx:04d}.mp4"
+            update("processing", f"Procesando escena {idx} ({mtype})...", pct_norm)
+
+            if mtype == "image":
+                process_image_kenburns(raw, norm, dur, idx, style_idx=i)
+            else:
+                process_video_clip(raw, norm, dur, idx)
+
             norm_paths.append(norm)
 
-        # ── FASE 2: Ensamblaje ─────────────────────────────────────────────
-        update("processing", "Ensamblando vídeo final con crossfade...", 92)
-        filtergraph, [out_v, out_a] = build_xfade_filtergraph(escenas_data)
+        # ── Ensamblaje final ───────────────────────────────────────────────
+        update("processing", f"Ensamblando {len(norm_paths)} clips con crossfade...", 92)
+        filtergraph, [out_v, out_a] = build_xfade_filtergraph(items)
         inputs = []
         for p in norm_paths:
             inputs += ["-i", str(p)]
@@ -255,25 +396,28 @@ def process_job(job_id: str, escenas_data: list):
 
         run_ffmpeg(ffmpeg_args, "ensamblaje_final")
 
-        size_mb = round(output_path.stat().st_size / 1_048_576, 2)
-        dur_total = sum(e["duracion_video"] for e in escenas_data)
-        dur_net   = dur_total - CROSSFADE_DUR * (total - 1)
+        size_mb  = round(output_path.stat().st_size / 1_048_576, 2)
+        dur_net  = sum(it["estimated_duration"] for it in items) - CROSSFADE_DUR * (total - 1)
 
-        job["status"]       = "done"
-        job["progress_pct"] = 100
-        job["message"]      = "Renderizado completado."
-        job["output_file"]  = str(output_path)
-        job["size_mb"]      = size_mb
-        job["duration_s"]   = round(dur_net, 1)
-        job["download_url"] = f"/download/{job_id}"
-        job["completed_at"] = datetime.now().isoformat()
+        job.update({
+            "status":       "done",
+            "progress_pct": 100,
+            "message":      "Renderizado completado.",
+            "output_file":  str(output_path),
+            "size_mb":      size_mb,
+            "duration_s":   round(dur_net, 1),
+            "download_url": f"/download/{job_id}",
+            "completed_at": datetime.now().isoformat()
+        })
         save_job_state(job_id)
-        log.info(f"  [{job_id[:8]}] ✅ DONE — {output_path.name} ({size_mb} MB, {dur_net:.0f}s)")
+        log.info(f"  [{job_id[:8]}] ✅ DONE — {size_mb}MB, {dur_net:.0f}s")
 
     except Exception as e:
-        job["status"]  = "error"
-        job["message"] = str(e)
-        job["updated_at"] = datetime.now().isoformat()
+        job.update({
+            "status":     "error",
+            "message":    str(e),
+            "updated_at": datetime.now().isoformat()
+        })
         save_job_state(job_id)
         log.error(f"  [{job_id[:8]}] ✗ ERROR: {e}")
 
@@ -281,8 +425,12 @@ def process_job(job_id: str, escenas_data: list):
 
 app = FastAPI(
     title="Yutu Render Server",
-    description="API REST para ensamblaje cinematográfico de vídeos documentales. Compatible con n8n.",
-    version="1.0.0"
+    description=(
+        "API REST para ensamblaje cinematográfico de vídeos documentales. "
+        "Soporta vídeos MP4 e imágenes JPG/PNG con efecto Ken Burns. "
+        "Compatible con n8n."
+    ),
+    version="2.0.0"
 )
 
 @app.on_event("startup")
@@ -290,94 +438,80 @@ def on_startup():
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     load_jobs_from_disk()
-    log.info("🚀 Yutu Render Server arrancado en http://0.0.0.0:8000")
+    log.info("🚀 Yutu Render Server v2.0 arrancado en http://0.0.0.0:8000")
 
 
 @app.get("/health")
 def health():
-    """Healthcheck — n8n puede usarlo para verificar que el servidor está vivo."""
     return {
         "status": "ok",
-        "server": "Yutu Render Server v1.0",
-        "jobs_activos": len([j for j in jobs.values() if j["status"] == "processing"]),
+        "server": "Yutu Render Server v2.0",
+        "jobs_procesando": len([j for j in jobs.values() if j["status"] == "processing"]),
         "jobs_total": len(jobs)
     }
 
 
 @app.post("/render", status_code=202)
-def render(req: RenderRequest, background_tasks: BackgroundTasks):
+def render(items: List[MediaItem], background_tasks: BackgroundTasks, job_name: Optional[str] = None):
     """
     Encola un job de renderizado.
 
-    Body (JSON):
-    {
-      "escenas": [
-        { "id_frase": 1, "duracion_video": 16, "url_video_mp4": "https://...", "origen_video": "..." },
-        ...
-      ],
-      "job_name": "documental_enero_ep1"   ← opcional
-    }
+    Body → array JSON directo (sin wrapper):
+    [
+      { "url": "https://cdn.pixabay.com/video/..._large.mp4", "posicion": 1, "score": 602970, "estimated_duration": 16 },
+      { "url": "https://pixabay.com/get/ga...1280.jpg",       "posicion": 2, "score": 143867, "estimated_duration": 18 },
+      { "url": "SIN_IMAGENES_DISPONIBLES",                    "posicion": 3, "score": 0,      "estimated_duration": 11 }
+    ]
 
     Respuesta inmediata (202 Accepted):
-    {
-      "job_id": "abc123...",
-      "status": "pending",
-      "status_url": "/status/abc123...",
-      "download_url": "/download/abc123..."
-    }
+    { "job_id": "...", "status": "pending", "status_url": "/status/...", "download_url": "/download/..." }
     """
-    if not req.escenas:
-        raise HTTPException(status_code=400, detail="El array 'escenas' no puede estar vacío.")
+    if not items:
+        raise HTTPException(status_code=400, detail="El array de media items no puede estar vacío.")
 
-    job_id = str(uuid.uuid4())
-    escenas_data = [e.dict() for e in req.escenas]
+    job_id     = str(uuid.uuid4())
+    items_data = [it.dict() for it in items]
+
+    # Analizar tipos de media
+    media_stats = {"video": 0, "image": 0, "invalid": 0}
+    for it in items_data:
+        media_stats[detect_media_type(it["url"])] += 1
 
     jobs[job_id] = {
-        "job_id":      job_id,
-        "job_name":    req.job_name or f"job_{job_id[:8]}",
-        "status":      "pending",
+        "job_id":       job_id,
+        "job_name":     job_name or f"job_{job_id[:8]}",
+        "status":       "pending",
         "progress_pct": 0,
-        "message":     "En cola. Iniciando en breve.",
-        "escenas":     len(escenas_data),
-        "created_at":  datetime.now().isoformat(),
-        "updated_at":  datetime.now().isoformat(),
-        "output_file": None,
-        "size_mb":     None,
-        "duration_s":  None,
+        "message":      "En cola.",
+        "total_items":  len(items_data),
+        "media_stats":  media_stats,
+        "created_at":   datetime.now().isoformat(),
+        "updated_at":   datetime.now().isoformat(),
+        "output_file":  None,
+        "size_mb":      None,
+        "duration_s":   None,
         "download_url": f"/download/{job_id}"
     }
     save_job_state(job_id)
+    background_tasks.add_task(process_job, job_id, items_data)
 
-    # Lanzar pipeline en thread background (no bloquea la respuesta)
-    background_tasks.add_task(process_job, job_id, escenas_data)
+    log.info(f"  Job {job_id[:8]} encolado: {len(items_data)} items "
+             f"({media_stats['video']} vídeos, {media_stats['image']} imágenes, {media_stats['invalid']} inválidos)")
 
-    log.info(f"  Job encolado: {job_id} ({len(escenas_data)} escenas)")
     return {
         "job_id":       job_id,
         "status":       "pending",
-        "escenas":      len(escenas_data),
+        "total_items":  len(items_data),
+        "media_stats":  media_stats,
         "status_url":   f"/status/{job_id}",
         "download_url": f"/download/{job_id}",
-        "message":      "Job aceptado. Usa status_url para monitorizar el progreso."
+        "message":      "Job aceptado. Monitoriza el progreso en status_url."
     }
 
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
-    """
-    Estado del job. Úsalo en n8n en un loop (cada 30-60s) hasta que status == 'done'.
-
-    Respuesta:
-    {
-      "job_id": "...",
-      "status": "pending | processing | done | error",
-      "progress_pct": 0-100,
-      "message": "...",
-      "download_url": "/download/...",   ← disponible cuando status == done
-      "size_mb": 123.4,
-      "duration_s": 457.0
-    }
-    """
+    """Polling del estado del job. Úsalo en n8n en un loop cada 30-60s."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' no encontrado.")
     j = jobs[job_id]
@@ -387,7 +521,8 @@ def status(job_id: str):
         "status":       j["status"],
         "progress_pct": j.get("progress_pct", 0),
         "message":      j.get("message"),
-        "escenas":      j.get("escenas"),
+        "total_items":  j.get("total_items"),
+        "media_stats":  j.get("media_stats"),
         "created_at":   j.get("created_at"),
         "updated_at":   j.get("updated_at"),
         "completed_at": j.get("completed_at"),
@@ -399,15 +534,12 @@ def status(job_id: str):
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
-    """
-    Descarga el MP4 final cuando el job esté en estado 'done'.
-    Devuelve el archivo directamente como response binario.
-    """
+    """Descarga el MP4 final. Solo disponible cuando status == 'done'."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' no encontrado.")
     j = jobs[job_id]
     if j["status"] != "done":
-        raise HTTPException(status_code=425, detail=f"Job aún en estado '{j['status']}'. Espera a que termine.")
+        raise HTTPException(status_code=425, detail=f"Job en estado '{j['status']}'. Espera a que termine.")
     output = Path(j["output_file"])
     if not output.exists():
         raise HTTPException(status_code=500, detail="Archivo de salida no encontrado en disco.")
@@ -420,7 +552,6 @@ def download(job_id: str):
 
 @app.get("/jobs")
 def list_jobs():
-    """Lista todos los jobs con su estado actual."""
     return {
         "total": len(jobs),
         "jobs": [
@@ -429,7 +560,7 @@ def list_jobs():
                 "job_name":     j.get("job_name"),
                 "status":       j["status"],
                 "progress_pct": j.get("progress_pct", 0),
-                "escenas":      j.get("escenas"),
+                "total_items":  j.get("total_items"),
                 "created_at":   j.get("created_at"),
             }
             for j in sorted(jobs.values(), key=lambda x: x.get("created_at", ""), reverse=True)
@@ -439,7 +570,6 @@ def list_jobs():
 
 @app.delete("/jobs/{job_id}")
 def delete_job(job_id: str):
-    """Elimina un job y sus archivos (limpieza)."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job no encontrado.")
     j = jobs.pop(job_id)
@@ -448,8 +578,6 @@ def delete_job(job_id: str):
         shutil.rmtree(job_dir)
     return {"deleted": job_id, "job_name": j.get("job_name")}
 
-
-# ─── ARRANQUE ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host=HOST, port=PORT, reload=False, workers=1)
