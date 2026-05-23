@@ -451,20 +451,11 @@ def health():
     }
 
 
-@app.post("/render", status_code=202)
-def render(items: List[MediaItem], background_tasks: BackgroundTasks, job_name: Optional[str] = None):
+@app.post("/render", status_code=200)
+def render(items: List[MediaItem], job_name: Optional[str] = None):
     """
-    Encola un job de renderizado.
-
-    Body → array JSON directo (sin wrapper):
-    [
-      { "url": "https://cdn.pixabay.com/video/..._large.mp4", "posicion": 1, "score": 602970, "estimated_duration": 16 },
-      { "url": "https://pixabay.com/get/ga...1280.jpg",       "posicion": 2, "score": 143867, "estimated_duration": 18 },
-      { "url": "SIN_IMAGENES_DISPONIBLES",                    "posicion": 3, "score": 0,      "estimated_duration": 11 }
-    ]
-
-    Respuesta inmediata (202 Accepted):
-    { "job_id": "...", "status": "pending", "status_url": "/status/...", "download_url": "/download/..." }
+    Renderiza el vídeo de forma SÍNCRONA.
+    El request se quedará cargando hasta que el vídeo final esté listo.
     """
     if not items:
         raise HTTPException(status_code=400, detail="El array de media items no puede estar vacío.")
@@ -472,7 +463,6 @@ def render(items: List[MediaItem], background_tasks: BackgroundTasks, job_name: 
     job_id     = str(uuid.uuid4())
     items_data = [it.dict() for it in items]
 
-    # Analizar tipos de media
     media_stats = {"video": 0, "image": 0, "invalid": 0}
     for it in items_data:
         media_stats[detect_media_type(it["url"])] += 1
@@ -480,9 +470,9 @@ def render(items: List[MediaItem], background_tasks: BackgroundTasks, job_name: 
     jobs[job_id] = {
         "job_id":       job_id,
         "job_name":     job_name or f"job_{job_id[:8]}",
-        "status":       "pending",
+        "status":       "processing",
         "progress_pct": 0,
-        "message":      "En cola.",
+        "message":      "Iniciando renderizado...",
         "total_items":  len(items_data),
         "media_stats":  media_stats,
         "created_at":   datetime.now().isoformat(),
@@ -493,19 +483,27 @@ def render(items: List[MediaItem], background_tasks: BackgroundTasks, job_name: 
         "download_url": f"/download/{job_id}"
     }
     save_job_state(job_id)
-    background_tasks.add_task(process_job, job_id, items_data)
 
-    log.info(f"  Job {job_id[:8]} encolado: {len(items_data)} items "
-             f"({media_stats['video']} vídeos, {media_stats['image']} imágenes, {media_stats['invalid']} inválidos)")
+    log.info(f"  Job {job_id[:8]} síncrono iniciado: {len(items_data)} items")
 
+    # Ejecutamos el pipeline de forma bloqueante (n8n se queda esperando)
+    process_job(job_id, items_data)
+
+    job_result = jobs[job_id]
+
+    if job_result["status"] == "error":
+        raise HTTPException(status_code=500, detail=f"Error en renderizado: {job_result['message']}")
+
+    # Retornar el resultado final
     return {
         "job_id":       job_id,
-        "status":       "pending",
+        "status":       job_result["status"],
         "total_items":  len(items_data),
         "media_stats":  media_stats,
-        "status_url":   f"/status/{job_id}",
-        "download_url": f"/download/{job_id}",
-        "message":      "Job aceptado. Monitoriza el progreso en status_url."
+        "size_mb":      job_result["size_mb"],
+        "duration_s":   job_result["duration_s"],
+        "download_url": job_result["download_url"],
+        "message":      "Renderizado completado con éxito."
     }
 
 
