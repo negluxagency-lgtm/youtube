@@ -220,7 +220,7 @@ def process_image_kenburns(img_path: Path, norm_path: Path, dur: int, idx: int, 
         "-i", str(img_path),
         "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
         "-vf", vf,
-        "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
         "-c:a", "aac", "-b:a", "192k",
         "-t", str(dur),
         "-map", "0:v", "-map", "1:a",
@@ -255,7 +255,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
         args = [
             "-i", str(raw_path),
             "-vf", vf, "-af", af,
-            "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             str(norm_path)
         ]
@@ -264,7 +264,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
             "-i", str(raw_path),
             "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
             "-vf", vf,
-            "-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             "-map", "0:v", "-map", "1:a",
             str(norm_path)
@@ -281,7 +281,7 @@ def create_black_frame(norm_path: Path, dur: int, idx: int):
         "-f", "lavfi", "-i",
         f"color=c=black:size={TARGET_W}x{TARGET_H}:rate={TARGET_FPS}:d={dur}",
         "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
-        "-c:v", "libx264", "-crf", str(CRF), "-preset", "fast",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k", "-t", str(dur),
         str(norm_path)
     ]
@@ -382,14 +382,14 @@ def process_job(job_id: str, items: list):
                 inputs
                 + ["-filter_complex", filtergraph]
                 + ["-map", out_v, "-map", out_a]
-                + ["-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET]
+                + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET]
                 + ["-c:a", "aac", "-b:a", "192k"]
                 + [str(output_path)]
             )
         else:
             ffmpeg_args = (
                 inputs
-                + ["-c:v", "libx264", "-crf", str(CRF), "-preset", PRESET]
+                + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET]
                 + ["-c:a", "aac", "-b:a", "192k"]
                 + [str(output_path)]
             )
