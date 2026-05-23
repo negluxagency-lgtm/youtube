@@ -56,8 +56,8 @@ PORT          = 8000
 TARGET_W      = 1920
 TARGET_H      = 1080
 TARGET_FPS    = 30
-CRF           = 18
-PRESET        = "slow"
+CRF           = 21
+PRESET        = "fast"
 CROSSFADE_DUR = 0.5
 DL_TIMEOUT    = 60
 MAX_RETRIES   = 3
@@ -136,6 +136,13 @@ def detect_media_type(url: str) -> str:
     return "video"  # default: asumir vídeo
 
 # ─── FFMPEG HELPERS ───────────────────────────────────────────────────────────
+
+def get_duration(path: Path) -> float:
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    try:
+        return float(subprocess.run(cmd, capture_output=True, text=True).stdout.strip())
+    except Exception:
+        return 0.0
 
 def run_ffmpeg(args: list, step: str) -> float:
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + args
@@ -251,7 +258,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
     )
 
     if has_audio:
-        af = f"atrim=start=0:end={dur},asetpts=PTS-STARTPTS,aresample=44100,pan=stereo|c0=c0|c1=c0"
+        af = f"atrim=start=0:end={dur},asetpts=PTS-STARTPTS,aresample=44100,pan=stereo|c0=c0|c1=c0,apad,atrim=0:{dur}"
         args = [
             "-stream_loop", "-1",
             "-i", str(raw_path),
@@ -314,19 +321,19 @@ def assemble_iterative_xfade(job_id: str, items: list, norm_paths: list, output_
         return
 
     current_path = norm_paths[0]
-    current_dur  = float(items[0]["estimated_duration"])
+    current_dur  = get_duration(current_path)
 
     for i in range(1, len(norm_paths)):
         is_last   = (i == len(norm_paths) - 1)
         next_path = norm_paths[i]
-        next_dur  = float(items[i]["estimated_duration"])
+        next_dur  = get_duration(next_path)
         out_path  = output_path if is_last else (temp_dir / f"_m{i:02d}.mp4")
 
         offset = max(0.0, current_dur - CROSSFADE_DUR)
 
-        # Intermedios: calidad alta pero rápida. Final: calidad cinematográfica.
+        # Intermedios: calidad alta pero MUY rápida. Final: calidad cinematográfica rápida.
         crf_val    = str(CRF)  if is_last else "14"
-        preset_val = PRESET    if is_last else "fast"
+        preset_val = PRESET    if is_last else "ultrafast"
 
         args = [
             "-i", str(current_path),
@@ -349,7 +356,7 @@ def assemble_iterative_xfade(job_id: str, items: list, norm_paths: list, output_
             temp_files.append(out_path)
 
         current_path = out_path
-        current_dur  = current_dur + next_dur - CROSSFADE_DUR
+        current_dur  = get_duration(out_path)
 
     # Limpieza de temporales
     for f in temp_files:
@@ -383,44 +390,45 @@ def process_job(job_id: str, items: list):
 
     try:
         total = len(items)
-        norm_paths = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        for i, item in enumerate(items):
+        def process_item(i, item):
             idx  = item["posicion"]
             url  = item["url"]
             dur  = item["estimated_duration"]
             mtype = detect_media_type(url)
 
-            pct_dl   = 5  + int((i / total) * 35)
-            pct_norm = 40 + int((i / total) * 50)
-
-            # ── Descarga ──────────────────────────────────────────────────
             if mtype == "invalid":
                 log.info(f"  [{job_id[:8]}] Escena {idx}: URL inválida → frame negro")
                 norm = clips_dir / f"norm_{idx:04d}.mp4"
-                update("processing", f"Generando frame negro para escena {idx}...", pct_dl)
                 create_black_frame(norm, dur, idx)
-                norm_paths.append(norm)
-                continue
+                return i, norm
 
-            # Extensión del archivo para descarga
             url_clean = url.split("?")[0]
             ext = Path(url_clean).suffix or (".jpg" if mtype == "image" else ".mp4")
             raw = clips_dir / f"raw_{idx:04d}{ext}"
 
-            update("processing", f"Descargando escena {idx} ({mtype})...", pct_dl)
             download_file(url, raw, idx)
 
-            # ── Normalización ─────────────────────────────────────────────
             norm = clips_dir / f"norm_{idx:04d}.mp4"
-            update("processing", f"Procesando escena {idx} ({mtype})...", pct_norm)
-
             if mtype == "image":
                 process_image_kenburns(raw, norm, dur, idx, style_idx=i)
             else:
                 process_video_clip(raw, norm, dur, idx)
 
-            norm_paths.append(norm)
+            return i, norm
+
+        update("processing", f"Descargando y normalizando {total} clips (paralelo)...", 30)
+        norm_paths_dict = {}
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(process_item, i, item) for i, item in enumerate(items)]
+            for future in as_completed(futures):
+                i, norm = future.result()
+                norm_paths_dict[i] = norm
+                update("processing", f"Clip {items[i]['posicion']} listo.", 30 + int((len(norm_paths_dict)/total)*60))
+
+        norm_paths = [norm_paths_dict[i] for i in range(total)]
 
         # ── Ensamblaje iterativo final ─────────────────────────────────────
         update("processing", f"Ensamblando {len(norm_paths)} clips (iterativo 2-en-2)...", 92)
