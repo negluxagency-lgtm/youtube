@@ -25,9 +25,10 @@ input_escenas.json
 [FASE 2] Normalización FFmpeg por clip:
          - Resolución: 1920x1080 (pad + scale, sin distorsión)
          - FPS: 30
-         - Codec video: libx264, CRF 18, preset slow
+         - Codec video: libx264, CRF 21, preset fast
          - Codec audio: aac 192k (silent si no hay audio)
          - Trim: exactamente duracion_video segundos desde el segundo 0
+         - (EJECUCIÓN PARALELIZADA PARA MAYOR VELOCIDAD)
          → artifacts/clips/norm_XX.mp4
        │
        ▼
@@ -47,8 +48,8 @@ input_escenas.json
 |---|---|---|
 | Resolución salida | 1920x1080 | Estándar YouTube 1080p |
 | FPS | 30 | Fluido y compatible |
-| CRF video | 18 | Alta calidad (< 23 = premium) |
-| Preset encode | slow | Máxima compresión/calidad |
+| CRF video | 21 | Equilibrio entre calidad y velocidad para YouTube |
+| Preset encode | fast | Aceleración del renderizado |
 | Crossfade duración | 0.5s | Suave pero sin ralentizar |
 | Crossfade tipo | fade | Neutro, cinematográfico |
 | Audio silencio | aevalsrc=0 | Si el clip no tiene audio |
@@ -63,6 +64,7 @@ input_escenas.json
 - ⛔ NO mezclar clips con distintos FPS/resolución antes de normalizar
 - ⛔ El offset de xfade debe calcularse acumulativamente restando la duración de crossfade
 - ⛔ Con N clips se necesitan N-1 xfades encadenados
+- ✅ La FASE 3 (Normalización) debe ejecutarse en paralelo (ThreadPoolExecutor)
 - ✅ Usar `-ss` ANTES de `-i` para seek rápido (keyframe), luego trim con filtro
 - ✅ Siempre generar audio aunque el clip original sea mudo (aevalsrc=0:s=44100:c=stereo)
 - ✅ Los clips descargados deben cachearse: si el archivo existe y pesa > 10KB, no re-descargar
@@ -73,7 +75,7 @@ input_escenas.json
 
 | Fecha | Error | Causa | Solución aplicada |
 |---|---|---|---|
-| - | - | - | - |
+| 2026-05-23 | Renderizado lento (40min para 13 clips) | Uso de preset slow de forma secuencial | Se cambia a preset fast, CRF 21 y se paraleliza la Fase 3 de normalización |
 
 ---
 

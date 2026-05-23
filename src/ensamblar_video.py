@@ -39,8 +39,8 @@ OUTPUT_FINAL   = ARTIFACTS_DIR / "documental_final.mp4"
 TARGET_W       = 1920
 TARGET_H       = 1080
 TARGET_FPS     = 30
-CRF            = 18
-PRESET         = "slow"
+CRF            = 21
+PRESET         = "fast"
 CROSSFADE_DUR  = 0.5        # segundos de overlap entre escenas
 DOWNLOAD_TIMEOUT = 60       # segundos por clip
 MAX_RETRIES    = 3
@@ -287,11 +287,11 @@ def main():
     log.info(f"  → Descarga completa. {len(raw_paths)} clips disponibles.")
 
     # ── FASE 3: Normalización de clips ─────────────────────────────────────
-    log.info(f"\n[FASE 3] Normalizando {len(escenas)} clips → 1920x1080@30fps...")
-    norm_paths = []
+    log.info(f"\n[FASE 3] Normalizando {len(escenas)} clips → 1920x1080@30fps (paralelo, max 4 workers)...")
+    norm_paths_dict = {}
     norm_results = []
 
-    for escena in escenas:
+    def _normalize(escena):
         idx = escena["id_frase"]
         dur = escena["duracion_video"]
         raw = raw_paths[idx]
@@ -300,18 +300,14 @@ def main():
         # Caché de normalización
         if norm.exists() and norm.stat().st_size > MIN_FILE_SIZE:
             log.info(f"  [Escena {idx:02d}] NORM CACHE HIT → {norm.name}")
-            norm_paths.append(norm)
-            norm_results.append({"id_frase": idx, "status": "cached_norm"})
-            continue
+            return {"id_frase": idx, "status": "cached_norm", "path": str(norm)}
 
         log.info(f"  [Escena {idx:02d}] Normalizando ({dur}s)...")
         try:
             result = normalize_clip(raw, norm, dur, idx)
-            norm_paths.append(norm)
-            norm_results.append(result)
+            return {**result, "path": str(norm)}
         except Exception as e:
             log.error(f"  [Escena {idx:02d}] ✗ Error de normalización: {e}")
-            # Intentar con parámetros más simples como fallback
             log.warning(f"  [Escena {idx:02d}] Reintentando con modo compatibilidad...")
             try:
                 compat_args = [
@@ -330,12 +326,22 @@ def main():
                     str(norm)
                 ]
                 run_ffmpeg(compat_args, f"compat_escena_{idx:02d}")
-                norm_paths.append(norm)
-                norm_results.append({"id_frase": idx, "status": "compat_mode"})
+                return {"id_frase": idx, "status": "compat_mode", "path": str(norm)}
             except Exception as e2:
                 log.error(f"  [Escena {idx:02d}] ✗ FALLO TOTAL: {e2}")
                 raise
 
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_normalize, e): e for e in escenas}
+        for future in as_completed(futures):
+            result = future.result()
+            idx = result["id_frase"]
+            norm_paths_dict[idx] = Path(result["path"])
+            norm_results.append(result)
+
+    norm_results.sort(key=lambda x: x["id_frase"])
+    norm_paths = [norm_paths_dict[e["id_frase"]] for e in escenas]
+    
     telemetry["fases"]["normalizacion"] = norm_results
     log.info(f"  → Normalización completa. {len(norm_paths)} clips listos.")
 
