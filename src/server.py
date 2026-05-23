@@ -253,6 +253,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
     if has_audio:
         af = f"atrim=start=0:end={dur},asetpts=PTS-STARTPTS,aresample=44100,pan=stereo|c0=c0|c1=c0"
         args = [
+            "-stream_loop", "-1",
             "-i", str(raw_path),
             "-vf", vf, "-af", af,
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
@@ -261,6 +262,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
         ]
     else:
         args = [
+            "-stream_loop", "-1",
             "-i", str(raw_path),
             "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
             "-vf", vf,
