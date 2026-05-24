@@ -66,6 +66,17 @@ MIN_FILE_SIZE = 5_000
 IMAGE_EXTS    = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTS    = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 
+# ─── HARDWARE ACELERATION (NVENC) ─────────────────────────────────────────────
+def check_nvenc_support():
+    try:
+        res = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+        return "h264_nvenc" in res.stdout
+    except:
+        return False
+
+HAS_NVENC = check_nvenc_support()
+VCODEC = "h264_nvenc" if HAS_NVENC else "libx264"
+
 # Estilos Ken Burns — se alternan por posición
 # Cada estilo es una expresión de FFmpeg zoompan
 KEN_BURNS_STYLES = [
@@ -263,7 +274,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
             "-stream_loop", "-1",
             "-i", str(raw_path),
             "-vf", vf, "-af", af,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
+            "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             str(norm_path)
         ]
@@ -273,7 +284,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
             "-i", str(raw_path),
             "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
             "-vf", vf,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
+            "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             "-map", "0:v", "-map", "1:a",
             str(norm_path)
@@ -290,7 +301,7 @@ def create_black_frame(norm_path: Path, dur: int, idx: int):
         "-f", "lavfi", "-i",
         f"color=c=black:size={TARGET_W}x{TARGET_H}:rate={TARGET_FPS}:d={dur}",
         "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", "fast",
+        "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k", "-t", str(dur),
         str(norm_path)
     ]
@@ -343,7 +354,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
             inputs
             + ["-filter_complex", filtergraph]
             + ["-map", out_v, "-map", out_a]
-            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
+            + ["-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
             + ["-crf", crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
@@ -351,7 +362,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
     else:
         args = (
             inputs
-            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
+            + ["-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
             + ["-crf", crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
