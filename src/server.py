@@ -56,8 +56,8 @@ PORT          = 8000
 TARGET_W      = 1920
 TARGET_H      = 1080
 TARGET_FPS    = 30
-CRF           = 21
-PRESET        = "fast"
+CRF           = 23
+PRESET        = "veryfast"
 CROSSFADE_DUR = 0.5
 DL_TIMEOUT    = 60
 MAX_RETRIES   = 3
@@ -298,76 +298,66 @@ def create_black_frame(norm_path: Path, dur: int, idx: int):
     return "black_frame"
 
 
-def assemble_iterative_xfade(job_id: str, items: list, norm_paths: list, output_path: Path):
-    """
-    Ensamblaje iterativo de 2 clips en 2 clips con xfade.
+def build_xfade_filtergraph(items: list) -> tuple[str, list]:
+    n = len(items)
+    if n == 1:
+        return "", ["0:v", "0:a"]
 
-    En lugar de un filter_complex masivo con N entradas (que se rompe con >2 clips
-    porque los streams paralelos se agotan antes de que xfade los necesite),
-    hacemos N-1 fusiones sucesivas:
-      clip1+clip2 → temp_01.mp4
-      temp_01+clip3 → temp_02.mp4
-      ...
-      temp_N-2+clipN → documental_final.mp4
+    parts_v = []
+    parts_a = []
+    offset_acum = 0.0
 
-    Cada fusión usa exactamente 2 entradas, que es lo que xfade garantiza.
-    """
-    temp_dir = output_path.parent / "_merge_temp"
-    temp_dir.mkdir(exist_ok=True)
-    temp_files = []
+    for i in range(n - 1):
+        dur_i = float(items[i]["estimated_duration"])
+        in_v = "[0:v]" if i == 0 else f"[vx{i}]"
+        in_a = "[0:a]" if i == 0 else f"[ax{i}]"
+        next_v = f"[{i+1}:v]"
+        next_a = f"[{i+1}:a]"
 
-    if len(norm_paths) == 1:
-        shutil.copy(str(norm_paths[0]), str(output_path))
-        return
+        offset_acum += dur_i - CROSSFADE_DUR
 
-    current_path = norm_paths[0]
-    current_dur  = get_duration(current_path)
+        out_v = f"[vx{i+1}]" if i < n - 2 else "[vfinal]"
+        out_a = f"[ax{i+1}]" if i < n - 2 else "[afinal]"
 
-    for i in range(1, len(norm_paths)):
-        is_last   = (i == len(norm_paths) - 1)
-        next_path = norm_paths[i]
-        next_dur  = get_duration(next_path)
-        out_path  = output_path if is_last else (temp_dir / f"_m{i:02d}.mp4")
+        parts_v.append(
+            f"{in_v}{next_v}xfade=transition=fade:duration={CROSSFADE_DUR}:offset={offset_acum:.4f}{out_v}"
+        )
+        parts_a.append(
+            f"{in_a}{next_a}acrossfade=d={CROSSFADE_DUR}:c1=tri:c2=tri{out_a}"
+        )
 
-        offset = max(0.0, current_dur - CROSSFADE_DUR)
+    filtergraph = "; ".join(parts_v + parts_a)
+    return filtergraph, ["[vfinal]", "[afinal]"]
 
-        # Intermedios: calidad alta pero MUY rápida. Final: calidad cinematográfica rápida.
-        crf_val    = str(CRF)  if is_last else "14"
-        preset_val = PRESET    if is_last else "ultrafast"
 
-        args = [
-            "-i", str(current_path),
-            "-i", str(next_path),
-            "-filter_complex",
-            (
-                f"[0:v][1:v]xfade=transition=fade:duration={CROSSFADE_DUR}:offset={offset:.4f}[v];"
-                f"[0:a][1:a]acrossfade=d={CROSSFADE_DUR}:c1=tri:c2=tri[a]"
-            ),
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-crf", crf_val, "-preset", preset_val,
-            "-c:a", "aac", "-b:a", "192k",
-            str(out_path)
-        ]
-        run_ffmpeg(args, f"merge_{i:02d}_de_{len(norm_paths)-1}")
-        log.info(f"  [{job_id[:8]}] Merge {i}/{len(norm_paths)-1} completado")
+def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_path: Path):
+    """Ensambla todos los clips en una sola pasada usando un único filter_complex."""
+    filtergraph, [out_v, out_a] = build_xfade_filtergraph(items)
 
-        if not is_last:
-            temp_files.append(out_path)
+    inputs = []
+    for p in norm_paths:
+        inputs += ["-i", str(p)]
 
-        current_path = out_path
-        current_dur  = get_duration(out_path)
+    if filtergraph:
+        args = (
+            inputs
+            + ["-filter_complex", filtergraph]
+            + ["-map", out_v, "-map", out_a]
+            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            + ["-crf", str(CRF), "-preset", PRESET]
+            + ["-c:a", "aac", "-b:a", "192k"]
+            + [str(output_path)]
+        )
+    else:
+        args = (
+            inputs
+            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            + ["-crf", str(CRF), "-preset", PRESET]
+            + ["-c:a", "aac", "-b:a", "192k"]
+            + [str(output_path)]
+        )
 
-    # Limpieza de temporales
-    for f in temp_files:
-        try:
-            f.unlink()
-        except Exception:
-            pass
-    try:
-        temp_dir.rmdir()
-    except Exception:
-        pass
+    run_ffmpeg(args, "ensamblaje_final")
 
 # ─── WORKER DEL JOB ──────────────────────────────────────────────────────────
 
@@ -430,9 +420,9 @@ def process_job(job_id: str, items: list):
 
         norm_paths = [norm_paths_dict[i] for i in range(total)]
 
-        # ── Ensamblaje iterativo final ─────────────────────────────────────
-        update("processing", f"Ensamblando {len(norm_paths)} clips (iterativo 2-en-2)...", 92)
-        assemble_iterative_xfade(job_id, items, norm_paths, output_path)
+        # ── Ensamblaje final de una sola pasada ─────────────────────────────────────
+        update("processing", f"Ensamblando {len(norm_paths)} clips (una sola pasada O(N))...", 92)
+        assemble_single_xfade(job_id, items, norm_paths, output_path)
 
         size_mb  = round(output_path.stat().st_size / 1_048_576, 2)
         dur_net  = sum(it["estimated_duration"] for it in items) - CROSSFADE_DUR * (total - 1)
