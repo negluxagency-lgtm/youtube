@@ -343,7 +343,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
             inputs
             + ["-filter_complex", filtergraph]
             + ["-map", out_v, "-map", out_a]
-            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
             + ["-crf", crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
@@ -351,7 +351,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
     else:
         args = (
             inputs
-            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
             + ["-crf", crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
@@ -368,7 +368,7 @@ def assemble_batched_xfade(job_id: str, items: list, norm_paths: list, output_pa
     temp_dir = output_path.parent / "_batches"
     temp_dir.mkdir(exist_ok=True)
     
-    batch_size = 15
+    batch_size = 5
     batches_paths = [norm_paths[i:i + batch_size] for i in range(0, len(norm_paths), batch_size)]
     batches_items = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     
