@@ -525,10 +525,10 @@ def health():
 
 
 @app.post("/render", status_code=200)
-def render(items: List[MediaItem], job_name: Optional[str] = None):
+def render(items: List[MediaItem], background_tasks: BackgroundTasks, job_name: Optional[str] = None):
     """
-    Renderiza el vídeo de forma SÍNCRONA.
-    El request se quedará cargando hasta que el vídeo final esté listo.
+    Renderiza el vídeo de forma ASÍNCRONA.
+    Devuelve job_id inmediatamente. Consulta /status/{job_id} para ver el progreso.
     """
     if not items:
         raise HTTPException(status_code=400, detail="El array de media items no puede estar vacío.")
@@ -557,26 +557,19 @@ def render(items: List[MediaItem], job_name: Optional[str] = None):
     }
     save_job_state(job_id)
 
-    log.info(f"  Job {job_id[:8]} síncrono iniciado: {len(items_data)} items")
+    log.info(f"  Job {job_id[:8]} asíncrono iniciado: {len(items_data)} items")
 
-    # Ejecutamos el pipeline de forma bloqueante (n8n se queda esperando)
-    process_job(job_id, items_data)
+    # Lanzar en background — respuesta inmediata a n8n
+    background_tasks.add_task(process_job, job_id, items_data)
 
-    job_result = jobs[job_id]
-
-    if job_result["status"] == "error":
-        raise HTTPException(status_code=500, detail=f"Error en renderizado: {job_result['message']}")
-
-    # Retornar el resultado final
     return {
         "job_id":       job_id,
-        "status":       job_result["status"],
+        "status":       "processing",
         "total_items":  len(items_data),
         "media_stats":  media_stats,
-        "size_mb":      job_result["size_mb"],
-        "duration_s":   job_result["duration_s"],
-        "download_url": job_result["download_url"],
-        "message":      "Renderizado completado con éxito."
+        "status_url":   f"/status/{job_id}",
+        "download_url": f"/download/{job_id}",
+        "message":      "Job encolado. Consulta status_url para ver el progreso."
     }
 
 
