@@ -330,7 +330,7 @@ def build_xfade_filtergraph(items: list) -> tuple[str, list]:
     return filtergraph, ["[vfinal]", "[afinal]"]
 
 
-def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_path: Path):
+def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_path: Path, crf: str = str(CRF), preset: str = PRESET):
     """Ensambla todos los clips en una sola pasada usando un único filter_complex."""
     filtergraph, [out_v, out_a] = build_xfade_filtergraph(items)
 
@@ -344,7 +344,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
             + ["-filter_complex", filtergraph]
             + ["-map", out_v, "-map", out_a]
             + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-            + ["-crf", str(CRF), "-preset", PRESET]
+            + ["-crf", crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
         )
@@ -352,12 +352,46 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
         args = (
             inputs
             + ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-            + ["-crf", str(CRF), "-preset", PRESET]
+            + ["-crf", crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
         )
 
-    run_ffmpeg(args, "ensamblaje_final")
+    run_ffmpeg(args, f"ensamblaje_pasada_{output_path.name}")
+
+
+def assemble_batched_xfade(job_id: str, items: list, norm_paths: list, output_path: Path):
+    if len(norm_paths) <= 15:
+        assemble_single_xfade(job_id, items, norm_paths, output_path)
+        return
+
+    temp_dir = output_path.parent / "_batches"
+    temp_dir.mkdir(exist_ok=True)
+    
+    batch_size = 15
+    batches_paths = [norm_paths[i:i + batch_size] for i in range(0, len(norm_paths), batch_size)]
+    batches_items = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+    
+    batch_outputs = []
+    batch_items_for_final = []
+    
+    for b_idx, (b_paths, b_items) in enumerate(zip(batches_paths, batches_items)):
+        b_out = temp_dir / f"batch_{b_idx:03d}.mp4"
+        log.info(f"  [{job_id[:8]}] Renderizando Batch {b_idx+1}/{len(batches_paths)} ({len(b_paths)} clips)...")
+        assemble_single_xfade(job_id, b_items, b_paths, b_out, crf="16", preset="superfast")
+        
+        batch_outputs.append(b_out)
+        batch_items_for_final.append({"estimated_duration": get_duration(b_out)})
+        
+    log.info(f"  [{job_id[:8]}] Ensamblando Final desde {len(batch_outputs)} batches...")
+    
+    assemble_single_xfade(job_id, batch_items_for_final, batch_outputs, output_path)
+    
+    for f in batch_outputs:
+        try: f.unlink()
+        except: pass
+    try: temp_dir.rmdir()
+    except: pass
 
 # ─── WORKER DEL JOB ──────────────────────────────────────────────────────────
 
@@ -420,9 +454,9 @@ def process_job(job_id: str, items: list):
 
         norm_paths = [norm_paths_dict[i] for i in range(total)]
 
-        # ── Ensamblaje final de una sola pasada ─────────────────────────────────────
-        update("processing", f"Ensamblando {len(norm_paths)} clips (una sola pasada O(N))...", 92)
-        assemble_single_xfade(job_id, items, norm_paths, output_path)
+        # ── Ensamblaje final (Batched O(N)) ─────────────────────────────────────
+        update("processing", f"Ensamblando {len(norm_paths)} clips (Batched O(N))...", 92)
+        assemble_batched_xfade(job_id, items, norm_paths, output_path)
 
         size_mb  = round(output_path.stat().st_size / 1_048_576, 2)
         dur_net  = sum(it["estimated_duration"] for it in items) - CROSSFADE_DUR * (total - 1)
