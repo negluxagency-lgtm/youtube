@@ -76,6 +76,8 @@ def check_nvenc_support():
 
 HAS_NVENC = check_nvenc_support()
 VCODEC = "h264_nvenc" if HAS_NVENC else "libx264"
+VPRESET = "p4" if HAS_NVENC else "veryfast"
+VQ_ARG = "-cq" if HAS_NVENC else "-crf"
 
 # Estilos Ken Burns — se alternan por posición
 # Cada estilo es una expresión de FFmpeg zoompan
@@ -274,7 +276,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
             "-stream_loop", "-1",
             "-i", str(raw_path),
             "-vf", vf, "-af", af,
-            "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
+            "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", VQ_ARG, str(CRF), "-preset", VPRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             str(norm_path)
         ]
@@ -284,7 +286,7 @@ def process_video_clip(raw_path: Path, norm_path: Path, dur: int, idx: int):
             "-i", str(raw_path),
             "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
             "-vf", vf,
-            "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", PRESET,
+            "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", VQ_ARG, str(CRF), "-preset", VPRESET,
             "-c:a", "aac", "-b:a", "192k", "-t", str(dur),
             "-map", "0:v", "-map", "1:a",
             str(norm_path)
@@ -301,7 +303,7 @@ def create_black_frame(norm_path: Path, dur: int, idx: int):
         "-f", "lavfi", "-i",
         f"color=c=black:size={TARGET_W}x{TARGET_H}:rate={TARGET_FPS}:d={dur}",
         "-f", "lavfi", "-i", f"aevalsrc=0:s=44100:c=stereo:d={dur}",
-        "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-crf", str(CRF), "-preset", "fast",
+        "-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", VQ_ARG, str(CRF), "-preset", VPRESET,
         "-c:a", "aac", "-b:a", "128k", "-t", str(dur),
         str(norm_path)
     ]
@@ -341,8 +343,10 @@ def build_xfade_filtergraph(items: list) -> tuple[str, list]:
     return filtergraph, ["[vfinal]", "[afinal]"]
 
 
-def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_path: Path, crf: str = str(CRF), preset: str = PRESET):
+def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_path: Path, crf: str = str(CRF), preset: str = None):
     """Ensambla todos los clips en una sola pasada usando un único filter_complex."""
+    if preset is None:
+        preset = VPRESET
     filtergraph, [out_v, out_a] = build_xfade_filtergraph(items)
 
     inputs = []
@@ -355,7 +359,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
             + ["-filter_complex", filtergraph]
             + ["-map", out_v, "-map", out_a]
             + ["-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
-            + ["-crf", crf, "-preset", preset]
+            + [VQ_ARG, crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
         )
@@ -363,7 +367,7 @@ def assemble_single_xfade(job_id: str, items: list, norm_paths: list, output_pat
         args = (
             inputs
             + ["-c:v", VCODEC, "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-max_muxing_queue_size", "4096"]
-            + ["-crf", crf, "-preset", preset]
+            + [VQ_ARG, crf, "-preset", preset]
             + ["-c:a", "aac", "-b:a", "192k"]
             + [str(output_path)]
         )
@@ -389,7 +393,7 @@ def assemble_batched_xfade(job_id: str, items: list, norm_paths: list, output_pa
     for b_idx, (b_paths, b_items) in enumerate(zip(batches_paths, batches_items)):
         b_out = temp_dir / f"batch_{b_idx:03d}.mp4"
         log.info(f"  [{job_id[:8]}] Renderizando Batch {b_idx+1}/{len(batches_paths)} ({len(b_paths)} clips)...")
-        assemble_single_xfade(job_id, b_items, b_paths, b_out, crf="16", preset="superfast")
+        assemble_single_xfade(job_id, b_items, b_paths, b_out, crf="16")
         
         batch_outputs.append(b_out)
         batch_items_for_final.append({"estimated_duration": get_duration(b_out)})
@@ -433,6 +437,8 @@ def process_job(job_id: str, items: list):
             dur  = item["estimated_duration"]
             mtype = detect_media_type(url)
 
+            log.info(f"    -> [Clip {idx}] Analizando: {mtype} | {url[:40]}...")
+
             if mtype == "invalid":
                 log.info(f"  [{job_id[:8]}] Escena {idx}: URL inválida → frame negro")
                 norm = clips_dir / f"norm_{idx:04d}.mp4"
@@ -443,14 +449,20 @@ def process_job(job_id: str, items: list):
             ext = Path(url_clean).suffix or (".jpg" if mtype == "image" else ".mp4")
             raw = clips_dir / f"raw_{idx:04d}{ext}"
 
+            log.info(f"    -> [Clip {idx}] Descargando...")
             download_file(url, raw, idx)
+            
+            if not raw.exists():
+                log.error(f"    -> [Clip {idx}] ERROR FATAL: El archivo descargado no existe en disco.")
 
+            log.info(f"    -> [Clip {idx}] Descarga OK. Lanzando FFmpeg...")
             norm = clips_dir / f"norm_{idx:04d}.mp4"
             if mtype == "image":
                 process_image_kenburns(raw, norm, dur, idx, style_idx=i)
             else:
                 process_video_clip(raw, norm, dur, idx)
 
+            log.info(f"    -> [Clip {idx}] Normalización FFmpeg OK.")
             return i, norm
 
         update("processing", f"Descargando y normalizando {total} clips (paralelo)...", 30)
